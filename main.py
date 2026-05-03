@@ -57,7 +57,9 @@ async def download_media(url: str, format_id: str):
             info = ydl.extract_info(url, download=False)
             title = info.get('title', 'media')
             ext = info.get('ext', 'mp4')
-            filename = f"{title}.{ext}"
+            # Sanitize filename to avoid header issues
+            safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '.', '_', '-')]).strip()
+            filename = f"{safe_title}.{ext}"
 
         return StreamingResponse(
             downloader.download_stream(url, format_id),
