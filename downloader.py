@@ -3,6 +3,7 @@ import os
 import tempfile
 import asyncio
 import random
+import certifi
 from typing import Dict, Any, List, Optional
 
 class MediaDownloader:
@@ -22,6 +23,7 @@ class MediaDownloader:
             'no_warnings': True,
             'nocheckcertificate': True,
             'ignoreerrors': False,
+            'external_downloader_args': ['--no-check-certificate'],
             'logtostderr': False,
             'no_color': True,
             'user_agent': random.choice(self.user_agents),
