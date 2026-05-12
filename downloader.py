@@ -3,7 +3,6 @@ import os
 import tempfile
 import asyncio
 import random
-import certifi
 from typing import Dict, Any, List, Optional
 
 class MediaDownloader:
@@ -23,25 +22,37 @@ class MediaDownloader:
             'no_warnings': True,
             'nocheckcertificate': True,
             'ignoreerrors': False,
-            'external_downloader_args': ['--no-check-certificate'],
             'logtostderr': False,
             'no_color': True,
             'user_agent': random.choice(self.user_agents),
-            # Anti-blocking headers
             'http_headers': {
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Sec-Fetch-Mode': 'navigate',
             },
-            # Handle potential age-restricted or login-required content
             'add_header': [
                 'Referer:https://www.google.com/',
             ],
+            # Use 'ios' client for YouTube to potentially bypass some bot checks
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios', 'web', 'mweb'],
+                    'skip': ['dash', 'hls']
+                }
+            }
         }
 
         if download:
+            # If it's a digit, it's a specific format. Otherwise it might be 'bestvideo+bestaudio'
+            if format_id:
+                if format_id.isdigit():
+                    opts['format'] = f"{format_id}+bestaudio/best"
+                else:
+                    opts['format'] = format_id
+            else:
+                opts['format'] = 'best'
+                
             opts.update({
-                'format': f"{format_id}+bestaudio/best" if format_id and format_id.isdigit() else (format_id or 'best'),
                 'outtmpl': temp_path,
                 'merge_output_format': 'mp4',
             })
@@ -57,17 +68,22 @@ class MediaDownloader:
         """Fetches media information using yt-dlp with retries and optimized settings."""
         loop = asyncio.get_event_loop()
         
-        # Try different user agents on failure
         last_error = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 ydl_opts = self._get_ydl_opts(download=False)
+                # Try different clients on different attempts
+                if attempt == 1:
+                    ydl_opts['extractor_args']['youtube']['player_client'] = ['android', 'web']
+                elif attempt == 2:
+                    ydl_opts['extractor_args']['youtube']['player_client'] = ['mweb']
+
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
                     return self._parse_info(info_dict, url)
             except Exception as e:
                 last_error = e
-                await asyncio.sleep(1) # Small delay between retries
+                await asyncio.sleep(1)
                 
         raise Exception(f"Failed to extract info: {str(last_error)}")
 
@@ -79,7 +95,8 @@ class MediaDownloader:
         # Audio-only formats
         for f in raw_formats:
             if f.get('vcodec') == 'none' and f.get('acodec') != 'none':
-                label = f"{f.get('abr', 'Unknown')}kbps" if f.get('abr') else f.get('format_note', 'Audio')
+                abr = f.get('abr') or f.get('tbr')
+                label = f"{int(abr)}kbps" if abr else f.get('format_note', 'Audio')
                 formats.append({
                     "format_id": f.get('format_id'),
                     "label": label,
@@ -106,8 +123,14 @@ class MediaDownloader:
         unique_formats = []
         seen_keys = set()
         
-        # Sort video by height desc, audio by bitrate desc
-        sorted_formats = sorted(formats, key=lambda x: (x['type'] == 'audio', -int(x['label'].replace('p', '').replace('kbps', '')) if x['label'].replace('p', '').replace('kbps', '').isdigit() else 0))
+        def get_sort_val(f):
+            label = f['label'].replace('p', '').replace('kbps', '')
+            try:
+                return int(label)
+            except:
+                return 0
+
+        sorted_formats = sorted(formats, key=lambda x: (x['type'] == 'audio', -get_sort_val(x)))
         
         for f in sorted_formats:
             key = (f['type'], f['label'])
@@ -127,40 +150,29 @@ class MediaDownloader:
 
     async def download_stream(self, url: str, format_id: str):
         """Downloads the media and yields chunks for streaming."""
-        fd, temp_path = tempfile.mkstemp()
-        os.close(fd)
-        
-        ydl_opts = self._get_ydl_opts(download=True, format_id=format_id, temp_path=temp_path)
-        
-        loop = asyncio.get_event_loop()
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
-                # yt-dlp might change the extension
-                actual_path = ydl.prepare_filename(info)
-                
-                # Check if it was merged or converted
-                if not os.path.exists(actual_path):
-                    # Try common extensions
-                    base = os.path.splitext(temp_path)[0]
-                    for ext in ['mp4', 'mkv', 'webm', 'm4a', 'mp3']:
-                        if os.path.exists(f"{base}.{ext}"):
-                            actual_path = f"{base}.{ext}"
-                            break
-                
-                if not os.path.exists(actual_path):
-                    actual_path = temp_path
-
-                with open(actual_path, 'rb') as f:
-                    while chunk := f.read(65536): # Larger chunks for efficiency
-                        yield chunk
-                        
-                if os.path.exists(actual_path):
-                    os.remove(actual_path)
-                if os.path.exists(temp_path) and actual_path != temp_path:
-                    os.remove(temp_path)
+        # Use a temporary directory to avoid conflicts
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = os.path.join(temp_dir, "download.%(ext)s")
+            ydl_opts = self._get_ydl_opts(download=True, format_id=format_id, temp_path=temp_path)
+            
+            loop = asyncio.get_event_loop()
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+                    actual_path = ydl.prepare_filename(info)
                     
-        except Exception as e:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise Exception(f"Download failed: {str(e)}")
+                    # If yt-dlp merged files, the actual path might be different from what we expect
+                    # Let's find the file in the temp directory
+                    files = os.listdir(temp_dir)
+                    if files:
+                        actual_path = os.path.join(temp_dir, files[0])
+                    
+                    if not os.path.exists(actual_path):
+                        raise Exception("Download completed but file not found")
+
+                    with open(actual_path, 'rb') as f:
+                        while chunk := f.read(1024 * 1024): # 1MB chunks
+                            yield chunk
+                            
+            except Exception as e:
+                raise Exception(f"Download failed: {str(e)}")
